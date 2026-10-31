@@ -44,7 +44,8 @@ first line of `hc events` is a snapshot with labels, both machines included) and
 - a workspace is ours by its `space` metadata token. A herdr restart forgets tokens and brings tabs back as
   plain shells, so the plugin's state directory keeps each workspace's label: a restored workspace with that label
   whose tabs all look like ours (`coordinator`, `FOUR-4 …`) is taken back and its tabs get their agents again;
-- tabs on a machine that is disconnected stay until it is back.
+- the sync closes nothing of a machine that is disconnected (an attach may still end by itself); its agents come
+  back when it reconnects.
 
 hc talks to herdr-core's `shepherdr` session (set `SHEPHERDR_HC_SESSION` in herdr's environment for another).
 Its log is `sync-*.log` in `~/.local/state/herdr/plugins/shepherdr/` (one per herdr server).

@@ -66,6 +66,7 @@ function herdr(...args: string[]): any {
 async function snapshot(): Promise<Terminal[]> {
   const p = Bun.spawn([HC, "events", "--json"], { stdout: "pipe", stderr: "ignore", stdin: "ignore", env: { ...process.env } });
   const decoder = new TextDecoder();
+  const timeout = setTimeout(() => p.kill(), 10_000);
   let buf = "";
   try {
     for await (const chunk of p.stdout) {
@@ -73,6 +74,7 @@ async function snapshot(): Promise<Terminal[]> {
       if (buf.includes("\n")) break;
     }
   } finally {
+    clearTimeout(timeout);
     p.kill();
   }
   const line = buf.split("\n")[0];
@@ -117,7 +119,9 @@ function desiredSpaces(terminals: Terminal[], ms: Machines): Map<string, Space> 
     let space = spaces.get(id);
     if (!space) spaces.set(id, (space = { id, label: machine ? `${machine}/${name}` : name, agents: [] }));
     const coordinator = t.labels!["shepherdr.role"] === "coordinator";
-    const key = coordinator ? "coordinator" : (t.labels!["shepherdr.task"] ?? t.address).replace(/^.*\//, "");
+    const task = t.labels!["shepherdr.task"];
+    if (!coordinator && !task) continue;
+    const key = coordinator ? "coordinator" : task!.replace(/^.*\//, "");
     const label = coordinator ? "coordinator" : t.title ? `${key} ${short(t.title)}` : key;
     // A restarted coordinator briefly overlaps its successor: the newest one wins.
     space.agents = space.agents.filter((a) => a.key !== key);
@@ -133,15 +137,30 @@ function desiredSpaces(terminals: Terminal[], ms: Machines): Map<string, Space> 
 const attached = new Map<string, string>();
 const opened = new Map<string, number>(); // address -> when we last opened a tab on it
 const gone = new Map<string, number>(); // space id -> since when it has no agents
+const released = new Set<string>(); // our tabs the human split a pane into: theirs once the agent ends
+
+// The address the `hc attach` in this pane is on, if one runs there.
+function attachedTo(paneId: string): string | undefined {
+  const info = run([HERDR, "pane", "process-info", "--pane", paneId]);
+  if (!info.ok) return undefined;
+  for (const p of JSON.parse(info.out).result.process_info.foreground_processes ?? []) {
+    const i = p.argv?.indexOf("attach") ?? -1;
+    if (i > 0 && /(^|\/)hc$/.test(p.argv[i - 1]) && p.argv[i + 1]) return p.argv[i + 1];
+  }
+}
+
+// Whether a tab's only pane still runs our attach, rather than a pane the human split off.
+function attachedPane(tab: any): boolean {
+  const paneId = firstPane(tab.workspace_id, tab.tab_id);
+  return !!paneId && !!attachedTo(paneId);
+}
 
 function adopt(workspaceId: string) {
+  const ours = new Set(tabsOf(workspaceId).filter((t) => looksOurs(t.label)).map((t) => t.tab_id));
   for (const pane of herdr("pane", "list", "--workspace", workspaceId).panes ?? []) {
-    if (attached.has(pane.tab_id)) continue;
-    const info = herdr("pane", "process-info", "--pane", pane.pane_id).process_info;
-    for (const p of info.foreground_processes ?? []) {
-      const i = p.argv?.indexOf("attach") ?? -1;
-      if (i > 0 && /(^|\/)hc$/.test(p.argv[i - 1]) && p.argv[i + 1]) attached.set(pane.tab_id, p.argv[i + 1]);
-    }
+    if (attached.has(pane.tab_id) || !ours.has(pane.tab_id)) continue;
+    const address = attachedTo(pane.pane_id);
+    if (address) attached.set(pane.tab_id, address);
   }
 }
 
@@ -157,7 +176,7 @@ function attach(paneId: string, address: string) {
 
 // Our tabs are labelled "coordinator" or "<task id> <title>"; the key is the first word.
 const keyOf = (label: string) => label.split(" ")[0];
-const looksOurs = (label: string) => /^(coordinator|[A-Z][A-Z0-9]*-\d+|t[0-9a-z]+)$/.test(keyOf(label));
+const looksOurs = (label: string) => /^(coordinator|[A-Z][A-Z0-9]*-\d+)$/.test(keyOf(label));
 
 function tabsOf(workspaceId: string): any[] {
   return herdr("tab", "list", "--workspace", workspaceId).tabs ?? [];
@@ -197,7 +216,7 @@ function reconcile(spaces: Map<string, Space>, ms: Machines) {
       let tab = tabs.find((t) => attached.get(t.tab_id) === agent.address);
       if (!tab) {
         // A tab herdr restored as a plain shell after a restart: put the agent back in it.
-        tab = tabs.find((t) => !attached.has(t.tab_id) && !live.has(t.tab_id) && keyOf(t.label) === agent.key);
+        tab = tabs.find((t) => !attached.has(t.tab_id) && !live.has(t.tab_id) && !released.has(t.tab_id) && keyOf(t.label) === agent.key);
         const paneId = tab && firstPane(ws.workspace_id, tab.tab_id);
         if (paneId) {
           attached.set(tab.tab_id, agent.address);
@@ -255,15 +274,20 @@ function reconcile(spaces: Map<string, Space>, ms: Machines) {
 }
 
 // Closes the tabs on agents that ended, and our tabs restored from before a restart that
-// no agent claimed. Other tabs the human opened stay.
+// no agent claimed. Other tabs the human opened stay, and so does one of ours where the
+// human split off a pane of their own: only the attach in it ends.
 function closeEnded(where: string, tabs: any[], live: Set<string>, ms: Machines) {
   for (const tab of tabs) {
-    if (live.has(tab.tab_id)) continue;
+    if (live.has(tab.tab_id) || released.has(tab.tab_id)) continue;
     const address = attached.get(tab.tab_id);
     if (address ? offline(address, ms) : !looksOurs(tab.label)) continue;
-    herdr("tab", "close", tab.tab_id);
     attached.delete(tab.tab_id);
-    log(`closed tab ${where} ${tab.label}`);
+    if (address && !(tab.pane_count === 1 && attachedPane(tab))) {
+      released.add(tab.tab_id);
+      continue;
+    }
+    // The attach usually ends by itself and takes its tab along; it may beat us to it.
+    if (run([HERDR, "tab", "close", tab.tab_id]).ok) log(`closed tab ${where} ${tab.label}`);
   }
 }
 
@@ -272,10 +296,9 @@ function stillLinked(): boolean {
   return plugins.some((p: any) => p.plugin_id === PLUGIN && p.enabled);
 }
 
-const pidAlive = (pid: number) => {
+const syncAlive = (pid: number) => {
   try {
-    process.kill(pid, 0);
-    return true;
+    return readFileSync(`/proc/${pid}/cmdline`, "utf8").includes("sync.ts");
   } catch {
     return false;
   }
@@ -284,7 +307,7 @@ const pidAlive = (pid: number) => {
 // Waits a little for an old holder: on a live handoff the new server starts its hook
 // before the old server's sync has noticed and left.
 async function lock(): Promise<boolean> {
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 30; i++) {
     try {
       const fd = openSync(pidFile, "wx");
       writeFileSync(fd, String(process.pid));
@@ -301,7 +324,7 @@ async function lock(): Promise<boolean> {
       try {
         pid = Number(readFileSync(pidFile, "utf8"));
       } catch {}
-      if (!pid || !pidAlive(pid)) {
+      if (!pid || !syncAlive(pid)) {
         try {
           unlinkSync(pidFile); // left by a sync that died
         } catch {}
@@ -346,8 +369,11 @@ async function follow() {
   for (;;) {
     const p = Bun.spawn([HC, "events", "--json"], { stdout: "pipe", stderr: "ignore", stdin: "ignore", env: { ...process.env } });
     const decoder = new TextDecoder();
+    let buf = "";
     for await (const chunk of p.stdout) {
-      if (!decoder.decode(chunk, { stream: true }).includes('"heartbeat"')) soon();
+      const lines = (buf + decoder.decode(chunk, { stream: true })).split("\n");
+      buf = lines.pop()!;
+      if (lines.some((line) => line && !line.includes('"method":"heartbeat"'))) soon();
     }
     log("hc events ended, following again");
     await Bun.sleep(5_000);
