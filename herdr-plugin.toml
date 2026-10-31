@@ -2,7 +2,7 @@ id = "shepherdr"
 name = "Shepherdr"
 version = "0.1.0"
 min_herdr_version = "0.9.5"
-description = "Shows Shepherdr's spaces, coordinators and tasks as herdr workspaces and tabs"
+description = "Shows Shepherdr's spaces and coordinators as herdr workspaces, with each task nested under its space"
 platforms = ["linux"]
 
 # Keeps herdr in step with herdr-core for as long as this herdr server runs.

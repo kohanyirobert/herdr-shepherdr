@@ -1,11 +1,12 @@
-// Mirrors Shepherdr's agents from herdr-core into herdr: one workspace per space, a
-// tab for its coordinator and one per task, each pane running `hc attach <address>`.
+// Mirrors Shepherdr's agents from herdr-core into herdr: one workspace per space with a
+// tab for its coordinator, and each task in a linked worktree workspace nested under it,
+// each pane running `hc attach <address>`.
 // One long-lived process per herdr server; it exits with that server, or when the
 // plugin is unlinked or disabled.
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const HERDR = process.env.HERDR_BIN_PATH ?? "herdr";
 const HC = process.env.SHEPHERDR_HC ?? "hc";
@@ -25,14 +26,15 @@ const GONE_MS = 10_000; // a restarting coordinator leaves its space empty for a
 type Terminal = {
   address: string;
   name?: string;
+  cwd?: string;
   argv?: string[];
   state: string;
   created_ms: number;
   title?: string;
   labels?: Record<string, string>;
 };
-type Agent = { key: string; label: string; address: string };
-type Space = { id: string; label: string; agents: Agent[] };
+type Agent = { key: string; label: string; address: string; cwd?: string; task: boolean };
+type Space = { id: string; label: string; folder: string; agents: Agent[] };
 type Machines = Map<string, { name: string; connected: boolean }>;
 
 // One sync per herdr server, keyed by its socket: a pid file, a state file and a log.
@@ -92,6 +94,10 @@ function machines(): Machines {
 
 // An address on a machine that isn't connected right now ("zephyrus/t15" while zephyrus is away).
 function offline(address: string, ms: Machines): boolean {
+  if (address.startsWith(LOOP)) {
+    const machine = ms.get(spaceMachine(address.slice(LOOP.length)));
+    return !!machine && !machine.connected;
+  }
   if (!address.includes("/")) return false;
   const name = address.split("/")[0];
   return ![...ms.values()].some((m) => m.name === name && m.connected);
@@ -117,7 +123,7 @@ function desiredSpaces(terminals: Terminal[], ms: Machines): Map<string, Space> 
     const name = folder === "~" ? "home" : folder; // Shepherdr calls the home folder's space "home"
     const machine = ms.get(spaceMachine(id))?.name;
     let space = spaces.get(id);
-    if (!space) spaces.set(id, (space = { id, label: machine ? `${machine}/${name}` : name, agents: [] }));
+    if (!space) spaces.set(id, (space = { id, label: machine ? `${machine}/${name}` : name, folder: name, agents: [] }));
     const coordinator = t.labels!["shepherdr.role"] === "coordinator";
     const task = t.labels!["shepherdr.task"];
     if (!coordinator && !task) continue;
@@ -125,7 +131,7 @@ function desiredSpaces(terminals: Terminal[], ms: Machines): Map<string, Space> 
     const label = coordinator ? "coordinator" : t.title ? `${key} ${short(t.title)}` : key;
     // A restarted coordinator briefly overlaps its successor: the newest one wins.
     space.agents = space.agents.filter((a) => a.key !== key);
-    const agent = { key, label, address: t.address };
+    const agent = { key, label, address: t.address, cwd: t.cwd, task: !coordinator };
     if (coordinator) space.agents.unshift(agent);
     else space.agents.push(agent);
   }
@@ -138,27 +144,56 @@ const attached = new Map<string, string>();
 const opened = new Map<string, number>(); // address -> when we last opened a tab on it
 const gone = new Map<string, number>(); // space id -> since when it has no agents
 
-// The address the `hc attach` in this pane is on, if one runs there.
+// A coordinator's tab runs attach-coordinator.sh, which attaches to whatever address the
+// sync writes to its space's file; it stands in the attached map as "loop:<space>".
+const LOOP = "loop:";
+const SCRIPT = "attach-coordinator.sh";
+const coordinatorsDir = join(stateDir, "coordinators");
+mkdirSync(coordinatorsDir, { recursive: true });
+const coordinatorFile = (space: string) => join(coordinatorsDir, encodeURIComponent(space));
+// A copy in the state directory, so coordinator tabs keep working whichever checkout of
+// the plugin started them, and after that checkout is gone.
+const script = join(stateDir, SCRIPT);
+writeFileSync(script, readFileSync(join(import.meta.dir, SCRIPT)));
+const quote = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`;
+
+// The address the `hc attach` in this pane is on, or the coordinator loop running there.
 function attachedTo(paneId: string): string | undefined {
   const info = run([HERDR, "pane", "process-info", "--pane", paneId]);
   if (!info.ok) return undefined;
-  for (const p of JSON.parse(info.out).result.process_info.foreground_processes ?? []) {
+  const fg: any[] = JSON.parse(info.out).result.process_info.foreground_processes ?? [];
+  for (const p of fg) {
+    const i = p.argv?.findIndex((a: string) => basename(a) === SCRIPT) ?? -1;
+    if (i >= 0 && p.argv[i + 1]) return LOOP + decodeURIComponent(basename(p.argv[i + 1]));
+  }
+  for (const p of fg) {
     const i = p.argv?.indexOf("attach") ?? -1;
     if (i > 0 && /(^|\/)hc$/.test(p.argv[i - 1]) && p.argv[i + 1]) return p.argv[i + 1];
   }
 }
+
+const SHELL = /(^|\/)-?(ba|z|fi|k|mk|da|tc|c|y)?sh$|(^|\/)nu$/;
 
 // Whether a pane is a shell at its prompt, with nothing of the human's running in it.
 function idleShell(paneId: string): boolean {
   const info = run([HERDR, "pane", "process-info", "--pane", paneId]);
   if (!info.ok) return false;
   const p = JSON.parse(info.out).result.process_info;
-  return p.shell_pid === p.foreground_process_group_id;
+  // An `exec hc attach` keeps the shell's pid, so the pid alone can't tell: the only
+  // thing in the foreground must be the shell program itself. Typing into anything
+  // else (an attach above all) would reach the agent as a message.
+  const fg: any[] = p.foreground_processes ?? [];
+  return (
+    p.shell_pid === p.foreground_process_group_id &&
+    fg.length > 0 &&
+    fg.every((f) => f.pid === p.shell_pid && SHELL.test(f.argv?.[0] ?? ""))
+  );
 }
 
 function adopt(workspaceId: string) {
   const ours = new Set(tabsOf(workspaceId).filter((t) => looksOurs(t.label)).map((t) => t.tab_id));
-  for (const pane of herdr("pane", "list", "--workspace", workspaceId).panes ?? []) {
+  const panes = run([HERDR, "pane", "list", "--workspace", workspaceId]);
+  for (const pane of panes.ok ? (JSON.parse(panes.out).result.panes ?? []) : []) {
     if (attached.has(pane.tab_id) || !ours.has(pane.tab_id)) continue;
     const address = attachedTo(pane.pane_id);
     if (address) attached.set(pane.tab_id, address);
@@ -169,9 +204,17 @@ function firstPane(workspaceId: string, tabId: string): string | undefined {
   return (herdr("pane", "list", "--workspace", workspaceId).panes ?? []).find((p: any) => p.tab_id === tabId)?.pane_id;
 }
 
+// Only ever into a pane we just opened, or an idle shell of ours: typed into anything
+// else (an attach above all) it would reach an agent as a message. A task's attach takes
+// its tab (and so its workspace) along when it ends. The coordinator's loop stays, so
+// the space's workspace, which its tasks nest under, stays in place while the
+// coordinator restarts.
 function attach(paneId: string, address: string) {
   const unset = HC_IDENTITY.map((name) => `-u ${name}`).join(" ");
-  herdr("pane", "run", paneId, `exec env ${unset} HC_SESSION=${SESSION} ${HC} attach ${address}`);
+  const what = address.startsWith(LOOP)
+    ? `HC=${quote(HC)} sh ${quote(script)} ${quote(coordinatorFile(address.slice(LOOP.length)))}`
+    : `${HC} attach ${address}`;
+  herdr("pane", "run", paneId, `exec env ${unset} HC_SESSION=${SESSION} ${what}`);
   opened.set(address, Date.now());
 }
 
@@ -179,99 +222,264 @@ function attach(paneId: string, address: string) {
 const keyOf = (label: string) => label.split(" ")[0];
 const looksOurs = (label: string) => /^(coordinator|[A-Z][A-Z0-9]*-\d+)$/.test(keyOf(label));
 
+// A workspace may close under us (its last attach ended): it then has no tabs.
 function tabsOf(workspaceId: string): any[] {
-  return herdr("tab", "list", "--workspace", workspaceId).tabs ?? [];
+  const r = run([HERDR, "tab", "list", "--workspace", workspaceId]);
+  return r.ok ? (JSON.parse(r.out).result.tabs ?? []) : [];
+}
+
+// herdr nests a linked Git worktree workspace under the workspace of its repo's main
+// checkout. A local space whose coordinator runs in a repo's main checkout is that
+// repo, and its tasks in their own linked worktrees nest under it for real. A space on
+// another machine, or not in a repo (home), gets a stand-in: an empty repo in the
+// state directory with an empty linked worktree per task, which only exists so herdr
+// nests them. Nothing here ever removes a worktree.
+type Base = { root: string; linked?: Set<string> };
+
+function git(dir: string, ...args: string[]) {
+  const config = ["user.name=shepherdr", "user.email=shepherdr@localhost", "commit.gpgsign=false", "core.hooksPath=/dev/null"];
+  return run(["git", "-C", dir, ...config.flatMap((c) => ["-c", c]), ...args]);
+}
+
+function baseOf(space: Space): Base {
+  const local = space.agents.every((a) => !a.address.includes("/"));
+  // A restarting coordinator is away for a moment: its tasks know the repo too.
+  const coordinator = space.agents.find((a) => !a.task);
+  const from = coordinator?.cwd ?? space.agents[0]?.cwd;
+  if (local && from && existsSync(join(from, ".git"))) {
+    const r = git(from, "worktree", "list", "--porcelain");
+    // Git refusing the repo (another owner, say) leaves the space with a stand-in.
+    const paths = r.ok ? [...r.out.matchAll(/^worktree (.*)$/gm)].map((m) => m[1]) : [];
+    if (paths[0] && (!coordinator || paths[0] === from)) return { root: paths[0], linked: new Set(paths.slice(1)) };
+  }
+  const dir = join(stateDir, "stand-ins", createHash("sha256").update(space.id).digest("hex").slice(0, 12));
+  const root = join(dir, space.folder.replace(/[^\w.-]+/g, "-"));
+  if (!existsSync(join(root, ".git"))) {
+    mkdirSync(root, { recursive: true });
+    if (!git(root, "init", "-q").ok || !git(root, "commit", "-q", "--allow-empty", "-m", "stand-in").ok) {
+      throw new Error(`can't make the stand-in repo ${root}`);
+    }
+  }
+  return { root: realpathSync(root) };
+}
+
+// Where a task's workspace opens: its own linked worktree, or its stand-in.
+function checkoutOf(base: Base, agent: Agent): string | undefined {
+  if (base.linked) return agent.cwd && base.linked.has(agent.cwd) ? agent.cwd : undefined;
+  const path = join(base.root, "..", "tasks", agent.key);
+  if (!existsSync(path) && !git(base.root, "worktree", "add", "-q", "--detach", path).ok) return undefined;
+  return path;
 }
 
 // Workspace tokens don't survive a herdr restart, so the state file remembers the label
-// each of our workspaces had. A restored workspace is ours again only if its label is
-// one of those and a tab in it looks like ours, so the human's own workspace of the same
-// name is never taken. Their tabs in ours stay theirs either way.
-function claimRestored(workspaces: any[]) {
-  let owned: Record<string, string> = {};
+// each of our workspaces had, with its space and task. A restored workspace is
+// ours again only if its label is one of those and a tab in it looks like ours, so the
+// human's own workspace of the same name is never taken. Their tabs in ours stay theirs
+// either way.
+type Owned = { space: string; task?: string; label: string; nested?: boolean };
+function readOwned(): Owned[] {
   try {
-    owned = JSON.parse(readFileSync(stateFile, "utf8"));
-  } catch {}
-  for (const [id, label] of Object.entries(owned)) {
-    if (workspaces.some((w) => w.tokens?.space === id)) continue;
+    const saved = JSON.parse(readFileSync(stateFile, "utf8"));
+    // Before tasks nested it was { space: label }.
+    return Array.isArray(saved) ? saved : Object.entries(saved).map(([space, label]) => ({ space, label: String(label) }));
+  } catch {
+    return [];
+  }
+}
+// Spaces whose workspace is from before tasks nested: it opened in the home folder, where
+// nothing can nest, so it is replaced once, when its space is next synced.
+const legacy = new Set(readOwned().filter((o) => !o.task && !o.nested).map((o) => o.space));
+
+function claimRestored(workspaces: any[]) {
+  for (const { space, task, label } of readOwned()) {
+    if (workspaces.some((w) => w.tokens?.space === space && w.tokens?.task === task)) continue;
     const ws = workspaces.find((w) => !w.tokens?.space && w.label === label && tabsOf(w.workspace_id).some((t) => looksOurs(t.label)));
-    if (ws) ws.tokens = { ...ws.tokens, space: id };
+    if (ws) ws.tokens = { ...ws.tokens, space, ...(task ? { task } : {}) };
   }
 }
 
+function tag(ws: any, space: string, task?: string) {
+  const tokens = ["--token", `space=${space}`, ...(task ? ["--token", `task=${task}`] : [])];
+  // It may have closed with its last tab since the workspace list.
+  if (!run([HERDR, "workspace", "report-metadata", ws.workspace_id, "--source", SOURCE, ...tokens]).ok) return;
+  ws.tokens = { ...ws.tokens, space, ...(task ? { task } : {}) };
+}
+
+// A workspace of ours left with only the human's tabs becomes theirs; false while a tab
+// of ours is still in it.
+function release(ws: any): boolean {
+  const tabs = tabsOf(ws.workspace_id);
+  if (tabs.some((t) => looksOurs(t.label))) return false;
+  if (!tabs.length) return true; // closed with its last tab
+  run([HERDR, "workspace", "report-metadata", ws.workspace_id, "--source", SOURCE, "--clear-token", "space", "--clear-token", "task"]);
+  if (ws.tokens?.task) run([HERDR, "workspace", "rename", ws.workspace_id, `ended ${ws.label}`]);
+  log(`left workspace ${ws.label} to the human`);
+  return true;
+}
+
 function reconcile(spaces: Map<string, Space>, ms: Machines) {
-  const workspaces: any[] = herdr("workspace", "list").workspaces ?? [];
+  let workspaces: any[] = herdr("workspace", "list").workspaces ?? [];
   claimRestored(workspaces);
   const live = new Set<string>();
-  const next: Record<string, string> = {};
+  const next = new Map<any, Owned>(); // workspace -> what the state file keeps of it
+  const keep = (ws: any) =>
+    next.set(ws.workspace_id, { space: ws.tokens.space, task: ws.tokens.task, label: ws.label, nested: !legacy.has(ws.tokens.space) });
+  // A task's workspace first: closing the main one first would leave them unnested.
+  const ofSpace = (id: string) =>
+    workspaces.filter((w) => w.tokens?.space === id).sort((a, b) => (b.tokens?.task ? 1 : 0) - (a.tokens?.task ? 1 : 0));
+  const tabsIn = (wss: any[]) => wss.flatMap((w) => (adopt(w.workspace_id), tabsOf(w.workspace_id)));
 
   for (const space of spaces.values()) {
     gone.delete(space.id);
-    let ws = workspaces.find((w) => w.tokens?.space === space.id);
-    let tabs: any[] = [];
-    if (ws) {
-      adopt(ws.workspace_id);
-      tabs = tabsOf(ws.workspace_id);
+    try {
+      syncSpace(space);
+    } catch (e) {
+      log(`sync of ${space.label} failed:`, (e as Error).message);
+      for (const ws of ofSpace(space.id)) keep(ws);
     }
+  }
+
+  function syncSpace(space: Space) {
+    const base = baseOf(space);
+    let main = workspaces.find((w) => w.tokens?.space === space.id && !w.tokens?.task);
+    if (legacy.has(space.id)) {
+      if (main) {
+        log(`replacing workspace ${main.label}, its tasks can't nest under it`);
+        closeEnded(main.label, tabsIn([main]), live, ms);
+        release(main);
+        workspaces = workspaces.filter((w) => w !== main);
+        main = undefined;
+      }
+      legacy.delete(space.id);
+    }
+    let tabs = tabsIn(ofSpace(space.id));
+
+    // Its first tab is the coordinator's; opened for a task, it waits there as a plain shell.
+    const openMain = () => {
+      const r = herdr("workspace", "create", "--label", space.label, "--cwd", base.root, "--no-focus");
+      main = r.workspace;
+      workspaces.push(main);
+      tag(main, space.id);
+      herdr("tab", "rename", r.tab.tab_id, "coordinator");
+      log(`workspace ${space.label}`);
+      return { tabId: r.tab.tab_id, paneId: r.root_pane.pane_id };
+    };
+
+    // The coordinator loop follows this file, so its tab stays across restarts.
+    const coordinator = space.agents.find((a) => !a.task)?.address ?? "";
+    const file = coordinatorFile(space.id);
+    if ((existsSync(file) ? readFileSync(file, "utf8") : "") !== coordinator) writeFileSync(file, coordinator);
+
     for (const agent of space.agents) {
-      let tab = tabs.find((t) => attached.get(t.tab_id) === agent.address);
+      const address = agent.task ? agent.address : LOOP + space.id;
+      let tab = tabs.find((t) => attached.get(t.tab_id) === address);
       if (!tab) {
         // A tab herdr restored as a plain shell after a restart: put the agent back in it.
         tab = tabs.find((t) => !attached.has(t.tab_id) && !live.has(t.tab_id) && keyOf(t.label) === agent.key);
-        const paneId = tab && firstPane(ws.workspace_id, tab.tab_id);
+        const paneId = tab && firstPane(tab.workspace_id, tab.tab_id);
         if (paneId && tab.pane_count === 1 && idleShell(paneId)) {
-          attached.set(tab.tab_id, agent.address);
-          attach(paneId, agent.address);
+          attached.set(tab.tab_id, address);
+          attach(paneId, address);
           log(`reattached ${space.label} ${agent.label} -> ${agent.address}`);
         } else tab = undefined;
       }
       if (tab) {
         live.add(tab.tab_id);
         if (tab.label !== agent.label) herdr("tab", "rename", tab.tab_id, agent.label);
+        const ws = workspaces.find((w) => w.workspace_id === tab.workspace_id);
+        if (agent.task && ws?.tokens?.task === agent.key && ws.label !== agent.label) {
+          herdr("workspace", "rename", ws.workspace_id, agent.label);
+        }
         continue;
       }
-      if (Date.now() - (opened.get(agent.address) ?? 0) < REOPEN_MS) continue;
-      let tabId: string, paneId: string;
-      if (!ws) {
-        const r = herdr("workspace", "create", "--label", space.label, "--cwd", homedir(), "--no-focus");
-        ws = r.workspace;
-        tabId = r.tab.tab_id;
-        paneId = r.root_pane.pane_id;
-        herdr("tab", "rename", tabId, agent.label);
-        log(`workspace ${space.label}`);
-      } else {
-        const r = herdr("tab", "create", "--workspace", ws.workspace_id, "--label", agent.label, "--cwd", homedir(), "--no-focus");
-        tabId = r.tab.tab_id;
-        paneId = r.root_pane.pane_id;
+      if (Date.now() - (opened.get(address) ?? 0) < REOPEN_MS) continue;
+
+      let where: { tabId: string; paneId: string } | undefined;
+      if (!main) {
+        const first = openMain();
+        if (!agent.task) where = first;
       }
-      attached.set(tabId, agent.address);
-      live.add(tabId);
-      attach(paneId, agent.address);
+      if (agent.task) {
+        // Its workspace from before, kept open by a tab of the human's.
+        const own = workspaces.find((w) => w.tokens?.space === space.id && w.tokens?.task === agent.key);
+        const path = own ? undefined : checkoutOf(base, agent);
+        // A workspace the human opened on that checkout stays theirs: herdr would relabel it.
+        const other = path && workspaces.some((w) => w.worktree?.checkout_path === path);
+        if (own) {
+          const r = herdr("tab", "create", "--workspace", own.workspace_id, "--label", agent.label, "--no-focus");
+          where = { tabId: r.tab.tab_id, paneId: r.root_pane.pane_id };
+        } else if (path && !other) {
+          const r = run([HERDR, "worktree", "open", "--workspace", main.workspace_id, "--path", path, "--label", agent.label, "--no-focus"]);
+          const res = r.ok ? JSON.parse(r.out).result : undefined;
+          if (res?.already_open) {
+            // Not a fresh pane: someone's workspace is on it already. Never type into it.
+            log(`not nesting ${agent.label}: ${res.workspace.label} is already open on ${path}`);
+          } else if (res) {
+            workspaces.push(res.workspace);
+            tag(res.workspace, space.id, agent.key);
+            herdr("tab", "rename", res.tab.tab_id, agent.label);
+            where = { tabId: res.tab.tab_id, paneId: res.root_pane.pane_id };
+          } else log(`can't nest ${agent.label} under ${space.label}: ${r.err.trim()}`);
+        }
+      }
+      if (!where) {
+        // A task that can't nest (no linked worktree of its own here) gets a tab, like the coordinator.
+        const r = herdr("tab", "create", "--workspace", main.workspace_id, "--label", agent.label, "--cwd", base.root, "--no-focus");
+        where = { tabId: r.tab.tab_id, paneId: r.root_pane.pane_id };
+      }
+      attached.set(where.tabId, address);
+      live.add(where.tabId);
+      attach(where.paneId, address);
       log(`tab ${space.label} ${agent.label} -> ${agent.address}`);
     }
-    if (!ws) continue;
-    herdr("workspace", "report-metadata", ws.workspace_id, "--source", SOURCE, "--token", `space=${space.id}`);
-    next[space.id] = ws.label;
-    closeEnded(space.label, tabs, live, ms);
+
+    // A main workspace opened again (its coordinator's tab closed with the last attach)
+    // isn't linked to the task workspaces still open: opening them again links them.
+    if (main && !main.worktree) {
+      for (const ws of ofSpace(space.id)) {
+        if (!ws.tokens.task || ws.worktree?.repo_root !== base.root) continue;
+        const r = run([HERDR, "worktree", "open", "--workspace", main.workspace_id, "--path", ws.worktree.checkout_path, "--label", ws.label, "--no-focus"]);
+        if (r.ok) main.worktree = { repo_root: base.root };
+      }
+    }
+
+    tabs = tabsIn(ofSpace(space.id));
+    for (const ws of ofSpace(space.id)) {
+      keep(ws);
+      if (!ws.tokens.task) tag(ws, space.id);
+      else if (space.agents.some((a) => a.key === ws.tokens.task)) tag(ws, space.id, ws.tokens.task);
+    }
+    // While its coordinator is away the main workspace's tabs stay, the waiting shell too.
+    const hasCoordinator = space.agents.some((a) => !a.task);
+    const ending = tabs.filter((t) => hasCoordinator || t.workspace_id !== main?.workspace_id);
+    closeEnded(space.label, ending, live, ms);
+    for (const ws of ofSpace(space.id)) {
+      if (ws.tokens.task && !space.agents.some((a) => a.key === ws.tokens.task) && release(ws)) {
+        next.delete(ws.workspace_id);
+      }
+    }
   }
 
   // Spaces with no agents left lose our tabs; closing the last tab closes the workspace,
   // so one where the human opened tabs of their own stays with those.
-  for (const ws of workspaces) {
-    const id = ws.tokens?.space;
-    if (!id || spaces.has(id)) continue;
-    next[id] = ws.label;
+  const ended = new Set(workspaces.map((w) => w.tokens?.space).filter((id) => id && !spaces.has(id)));
+  for (const id of ended) {
+    const wss = ofSpace(id);
+    for (const ws of wss) keep(ws);
     const machine = ms.get(spaceMachine(id));
     if (machine && !machine.connected) continue;
     if (!gone.has(id)) gone.set(id, Date.now());
     if (Date.now() - gone.get(id)! < GONE_MS) continue;
-    adopt(ws.workspace_id);
-    closeEnded(ws.label, tabsOf(ws.workspace_id), live, ms);
+    writeFileSync(coordinatorFile(id), ""); // a coordinator tab that can't close waits idle
+    for (const ws of wss) {
+      closeEnded(ws.label, tabsIn([ws]), live, ms);
+      if (ws.tokens.task) release(ws);
+      next.delete(ws.workspace_id);
+    }
     gone.delete(id);
-    delete next[id];
   }
   for (const [tabId, address] of attached) if (!live.has(tabId) && !offline(address, ms)) attached.delete(tabId);
-  writeFileSync(stateFile, JSON.stringify(next, null, 2));
+  writeFileSync(stateFile, JSON.stringify([...next.values()], null, 2));
 }
 
 // Closes the tabs on agents that ended, and our tabs restored from before a restart that
@@ -284,7 +492,7 @@ function closeEnded(where: string, tabs: any[], live: Set<string>, ms: Machines)
     if (address ? offline(address, ms) : !looksOurs(tab.label)) continue;
     attached.delete(tab.tab_id);
     const paneId = tab.pane_count === 1 ? firstPane(tab.workspace_id, tab.tab_id) : undefined;
-    if (paneId && (address ? attachedTo(paneId) : idleShell(paneId))) {
+    if (paneId && ((address && attachedTo(paneId)) || idleShell(paneId))) {
       // The attach usually ends by itself and takes its tab along; it may beat us to it.
       if (run([HERDR, "tab", "close", tab.tab_id]).ok) log(`closed tab ${where} ${tab.label}`);
     } else if (run([HERDR, "tab", "rename", tab.tab_id, `ended ${tab.label}`]).ok) {
