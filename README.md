@@ -50,9 +50,9 @@ The log is in `herdr plugin log list --plugin shepherdr`.
 
 ## Good to know
 
-- `hc attach` resizes the agent's terminal to the herdr pane (a 200×120 agent became 119×40). Whoever resized
-  last wins: the web UI resizes it back when you open the agent there, and the agent keeps the last size after
-  either of you leaves.
+- `hc attach` resizes the agent's terminal to the herdr pane (a 200×120 agent became 119×40). Whoever resizes
+  last wins, and the agent keeps that size after you leave: the web UI shows it at that size, and while attached
+  it was resized again by another viewer (119 to 80 columns, likely the web UI on a phone).
 - Detaching with `ctrl+\` ends the tab's command and closes the tab; the sync opens it again within half a
-  minute. Close the workspace or unlink the plugin to stop seeing an agent.
+  minute, as it does for a tab or workspace you close. Unlink the plugin to stop seeing them.
 - Two herdr servers with the plugin (say a named session) both attach, with the same resize rule.
