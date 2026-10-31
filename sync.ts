@@ -151,6 +151,11 @@ const SCRIPT = "attach-coordinator.sh";
 const coordinatorsDir = join(stateDir, "coordinators");
 mkdirSync(coordinatorsDir, { recursive: true });
 const coordinatorFile = (space: string) => join(coordinatorsDir, encodeURIComponent(space));
+// A copy in the state directory, so coordinator tabs keep working whichever checkout of
+// the plugin started them, and after that checkout is gone.
+const script = join(stateDir, SCRIPT);
+writeFileSync(script, readFileSync(join(import.meta.dir, SCRIPT)));
+const quote = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`;
 
 // The address the `hc attach` in this pane is on, or the coordinator loop running there.
 function attachedTo(paneId: string): string | undefined {
@@ -207,7 +212,7 @@ function firstPane(workspaceId: string, tabId: string): string | undefined {
 function attach(paneId: string, address: string) {
   const unset = HC_IDENTITY.map((name) => `-u ${name}`).join(" ");
   const what = address.startsWith(LOOP)
-    ? `HC=${HC} sh ${join(import.meta.dir, SCRIPT)} ${coordinatorFile(address.slice(LOOP.length))}`
+    ? `HC=${quote(HC)} sh ${quote(script)} ${quote(coordinatorFile(address.slice(LOOP.length)))}`
     : `${HC} attach ${address}`;
   herdr("pane", "run", paneId, `exec env ${unset} HC_SESSION=${SESSION} ${what}`);
   opened.set(address, Date.now());
@@ -465,6 +470,7 @@ function reconcile(spaces: Map<string, Space>, ms: Machines) {
     if (machine && !machine.connected) continue;
     if (!gone.has(id)) gone.set(id, Date.now());
     if (Date.now() - gone.get(id)! < GONE_MS) continue;
+    writeFileSync(coordinatorFile(id), ""); // a coordinator tab that can't close waits idle
     for (const ws of wss) {
       closeEnded(ws.label, tabsIn([ws]), live, ms);
       if (ws.tokens.task) release(ws);

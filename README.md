@@ -91,7 +91,7 @@ Its log is `sync-*.log` in `~/.local/state/herdr/plugins/shepherdr/` (one per he
 - Detaching with `ctrl+\` from a task ends the tab's command and closes it (and the task's workspace with it); the
   sync opens it again within a minute, as it does for a tab or workspace you close. The coordinator's tab runs
   `attach-coordinator.sh`, which attaches again within 10 seconds, and to a restarted coordinator in the same tab, so
-  the space's workspace stays where it is with its tasks nested under it (`ctrl+c` there closes the tab; the sync
-  opens it again). The sync never types into a pane that runs something: only into one it just opened, or a shell
-  of its own at its prompt after a herdr restart. Unlink the plugin to stop seeing them.
+  the space's workspace stays where it is with its tasks nested under it. The sync never types into a pane that runs
+  something: only into one it just opened, or a shell of its own at its prompt after a herdr restart. Unlink the
+  plugin to stop seeing them.
 - Two herdr servers with the plugin (say a named session) both attach, with the same resize rule.
