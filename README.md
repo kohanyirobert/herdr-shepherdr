@@ -13,12 +13,12 @@ open herdr and they are there:
   chat like a message from you.
 
 It stays in sync while herdr runs: a new task gets a tab, a task that ends loses its tab, and a space with no agents
-left loses its workspace. Tabs you open yourself in those workspaces are left alone. Browser and helper shells are
-not shown.
+left loses its workspace. Tabs you open yourself in those workspaces are left alone (a workspace with one of yours
+stays open). Browser and helper shells are not shown.
 
 ## Install
 
-Needs herdr 0.9.5 or later, `bun` and `hc` on `PATH`.
+Needs Linux, herdr 0.9.5 or later, `bun` and `hc` on `PATH`.
 
 ```sh
 gh repo clone kohanyirobert/herdr-shepherdr ~/Work/herdr-shepherdr
@@ -31,7 +31,8 @@ The sync starts with the herdr server. If herdr is already running, start it onc
 herdr plugin action invoke shepherdr.sync
 ```
 
-Remove it with `herdr plugin unlink shepherdr`; then close its workspaces yourself.
+Remove it with `herdr plugin unlink shepherdr`: the sync stops within 15 seconds, then close its workspaces
+yourself.
 
 ## How it works
 
@@ -40,19 +41,19 @@ follows `hc events`, and on every change, and every 15 seconds, it reads all ter
 first line of `hc events` is a snapshot with labels, both machines included) and makes herdr match:
 
 - agents are the live terminals labelled `shepherdr.role` `coordinator` or `task`, grouped by `shepherdr.space`;
-- a workspace is ours by its `space` metadata token, or, after a herdr restart (which forgets tokens and brings
-  tabs back as plain shells), by the label it had, kept in the plugin's state directory; restored tabs get their
-  agent back;
+- a workspace is ours by its `space` metadata token. A herdr restart forgets tokens and brings tabs back as
+  plain shells, so the plugin's state directory keeps each workspace's label: a restored workspace with that label
+  whose tabs all look like ours (`coordinator`, `FOUR-4 …`) is taken back and its tabs get their agents again;
 - tabs on a machine that is disconnected stay until it is back.
 
 hc talks to herdr-core's `shepherdr` session (set `SHEPHERDR_HC_SESSION` in herdr's environment for another).
-The log is in `herdr plugin log list --plugin shepherdr`.
+Its log is `sync-*.log` in `~/.local/state/herdr/plugins/shepherdr/` (one per herdr server).
 
 ## Good to know
 
 - `hc attach` resizes the agent's terminal to the herdr pane (a 200×120 agent became 119×40). Whoever resizes
   last wins, and the agent keeps that size after you leave: the web UI shows it at that size, and while attached
   it was resized again by another viewer (119 to 80 columns, likely the web UI on a phone).
-- Detaching with `ctrl+\` ends the tab's command and closes the tab; the sync opens it again within half a
+- Detaching with `ctrl+\` ends the tab's command and closes the tab; the sync opens it again within a
   minute, as it does for a tab or workspace you close. Unlink the plugin to stop seeing them.
 - Two herdr servers with the plugin (say a named session) both attach, with the same resize rule.

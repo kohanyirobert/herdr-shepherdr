@@ -1,13 +1,15 @@
 // Mirrors Shepherdr's agents from herdr-core into herdr: one workspace per space, a
 // tab for its coordinator and one per task, each pane running `hc attach <address>`.
-// One long-lived process per herdr server; it exits when that server goes away.
-import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+// One long-lived process per herdr server; it exits with that server, or when the
+// plugin is unlinked or disabled.
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const HERDR = process.env.HERDR_BIN_PATH ?? "herdr";
 const HC = process.env.SHEPHERDR_HC ?? "hc";
+const PLUGIN = process.env.HERDR_PLUGIN_ID ?? "shepherdr";
 // Shepherdr runs its agents in herdr-core's "shepherdr" session. Drop any hc identity
 // herdr inherited (say, when it was started inside a core terminal) so hc talks to that
 // session as the human, and the panes we start do the same.
@@ -17,6 +19,8 @@ for (const name of HC_IDENTITY) delete process.env[name];
 process.env.HC_SESSION = SESSION;
 const SOURCE = "shepherdr"; // workspace metadata source; its `space` token marks our workspaces
 const TICK_MS = 15_000; // also catches tabs the human closed, which hc events can't see
+const REOPEN_MS = 30_000; // an attach that keeps failing can't spin
+const GONE_MS = 10_000; // a restarting coordinator leaves its space empty for a moment
 
 type Terminal = {
   address: string;
@@ -29,9 +33,22 @@ type Terminal = {
 };
 type Agent = { key: string; label: string; address: string };
 type Space = { id: string; label: string; agents: Agent[] };
+type Machines = Map<string, { name: string; connected: boolean }>;
+
+// One sync per herdr server, keyed by its socket: a pid file, a state file and a log.
+const stateDir = process.env.HERDR_PLUGIN_STATE_DIR ?? join(homedir(), ".local/state/herdr-shepherdr");
+mkdirSync(stateDir, { recursive: true });
+const serverId = createHash("sha256").update(process.env.HERDR_SOCKET_PATH ?? "default").digest("hex").slice(0, 12);
+const pidFile = join(stateDir, `sync-${serverId}.pid`);
+const stateFile = join(stateDir, `spaces-${serverId}.json`);
+const logFile = join(stateDir, `sync-${serverId}.log`);
 
 function log(...args: unknown[]) {
-  console.error(new Date().toISOString(), ...args);
+  const line = [new Date().toISOString(), ...args].join(" ");
+  console.error(line);
+  try {
+    appendFileSync(logFile, line + "\n");
+  } catch {}
 }
 
 function run(cmd: string[]): { ok: boolean; out: string; err: string } {
@@ -39,27 +56,21 @@ function run(cmd: string[]): { ok: boolean; out: string; err: string } {
   return { ok: p.exitCode === 0, out: p.stdout.toString(), err: p.stderr.toString() };
 }
 
-class HerdrGone extends Error {}
-
 function herdr(...args: string[]): any {
   const r = run([HERDR, ...args]);
-  if (!r.ok) {
-    if (/connect|No such file|refused|not running/i.test(r.err)) throw new HerdrGone(r.err.trim());
-    throw new Error(`herdr ${args.join(" ")}: ${r.err.trim()}`);
-  }
+  if (!r.ok) throw new Error(`herdr ${args.join(" ")}: ${r.err.trim()}`);
   return r.out.trim() ? JSON.parse(r.out).result : null;
 }
 
 // The first line of `hc events` is a snapshot of every terminal on every machine, labels included.
 async function snapshot(): Promise<Terminal[]> {
   const p = Bun.spawn([HC, "events", "--json"], { stdout: "pipe", stderr: "ignore", stdin: "ignore", env: { ...process.env } });
-  const reader = p.stdout.getReader();
+  const decoder = new TextDecoder();
   let buf = "";
   try {
-    while (!buf.includes("\n")) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += new TextDecoder().decode(value);
+    for await (const chunk of p.stdout) {
+      buf += decoder.decode(chunk, { stream: true });
+      if (buf.includes("\n")) break;
     }
   } finally {
     p.kill();
@@ -69,30 +80,40 @@ async function snapshot(): Promise<Terminal[]> {
   return JSON.parse(line).terminals ?? [];
 }
 
-function machines(): Map<string, { name: string; connected: boolean }> {
+function machines(): Machines {
   const r = run([HC, "machine", "ls", "--json"]);
-  const map = new Map<string, { name: string; connected: boolean }>();
-  if (r.ok) for (const m of JSON.parse(r.out).machines ?? []) map.set(m.id, { name: m.name, connected: m.state === "connected" });
+  if (!r.ok) throw new Error(`hc machine ls: ${r.err.trim()}`);
+  const map: Machines = new Map();
+  for (const m of JSON.parse(r.out).machines ?? []) map.set(m.id, { name: m.name, connected: m.state === "connected" });
   return map;
 }
+
+// An address on a machine that isn't connected right now ("zephyrus/t15" while zephyrus is away).
+function offline(address: string, ms: Machines): boolean {
+  if (!address.includes("/")) return false;
+  const name = address.split("/")[0];
+  return ![...ms.values()].some((m) => m.name === name && m.connected);
+}
+
+const spaceMachine = (id: string) => id.match(/^p:([^:]*):/)?.[1] ?? "";
 
 function short(text: string, max = 28): string {
   return text.length > max ? text.slice(0, max - 1).trimEnd() + "…" : text;
 }
 
-function desiredSpaces(terminals: Terminal[], ms: ReturnType<typeof machines>): Map<string, Space> {
+function desiredSpaces(terminals: Terminal[], ms: Machines): Map<string, Space> {
   const spaces = new Map<string, Space>();
   const agents = terminals
-    .filter((t) => t.state === "live")
+    .filter((t) => t.state === "live" && !offline(t.address, ms))
     .filter((t) => ["coordinator", "task"].includes(t.labels?.["shepherdr.role"] ?? ""))
     .filter((t) => !t.name?.startsWith("sb-") && t.argv?.[0] !== "sh")
     .sort((a, b) => a.created_ms - b.created_ms);
   for (const t of agents) {
     const id = t.labels!["shepherdr.space"];
     if (!id) continue;
-    const [, machineId = "", folder = id] = id.match(/^p:([^:]*):(.*)$/) ?? [];
+    const folder = id.match(/^p:[^:]*:(.*)$/)?.[1] ?? id;
     const name = folder === "~" ? "home" : folder; // Shepherdr calls the home folder's space "home"
-    const machine = ms.get(machineId)?.name ?? null;
+    const machine = ms.get(spaceMachine(id))?.name;
     let space = spaces.get(id);
     if (!space) spaces.set(id, (space = { id, label: machine ? `${machine}/${name}` : name, agents: [] }));
     const coordinator = t.labels!["shepherdr.role"] === "coordinator";
@@ -110,9 +131,8 @@ function desiredSpaces(terminals: Terminal[], ms: ReturnType<typeof machines>): 
 // tab id -> the core address its pane is attached to. Filled when we open a tab, and
 // from the pane's process otherwise, so a restarted sync adopts the tabs it left.
 const attached = new Map<string, string>();
-// address -> when we last opened a tab on it, so an attach that keeps failing can't spin.
-const opened = new Map<string, number>();
-const REOPEN_MS = 30_000;
+const opened = new Map<string, number>(); // address -> when we last opened a tab on it
+const gone = new Map<string, number>(); // space id -> since when it has no agents
 
 function adopt(workspaceId: string) {
   for (const pane of herdr("pane", "list", "--workspace", workspaceId).panes ?? []) {
@@ -137,39 +157,41 @@ function attach(paneId: string, address: string) {
 
 // Our tabs are labelled "coordinator" or "<task id> <title>"; the key is the first word.
 const keyOf = (label: string) => label.split(" ")[0];
-const looksOurs = (label: string) => /^(coordinator|[A-Z][A-Z0-9]*-\d+)$/.test(keyOf(label));
+const looksOurs = (label: string) => /^(coordinator|[A-Z][A-Z0-9]*-\d+|t[0-9a-z]+)$/.test(keyOf(label));
 
-// Workspace tokens don't survive a herdr restart, so remember which workspaces are ours.
-let stateFile = "";
-function loadOwned(): Record<string, string> {
+function tabsOf(workspaceId: string): any[] {
+  return herdr("tab", "list", "--workspace", workspaceId).tabs ?? [];
+}
+
+// Workspace tokens don't survive a herdr restart, so the state file remembers the label
+// each of our workspaces had. A restored workspace is ours again only if its label is
+// one of those and every tab in it looks like ours, so the human's own workspace of the
+// same name is never taken.
+function claimRestored(workspaces: any[]) {
+  let owned: Record<string, string> = {};
   try {
-    return JSON.parse(readFileSync(stateFile, "utf8"));
-  } catch {
-    return {};
+    owned = JSON.parse(readFileSync(stateFile, "utf8"));
+  } catch {}
+  for (const [id, label] of Object.entries(owned)) {
+    if (workspaces.some((w) => w.tokens?.space === id)) continue;
+    const ws = workspaces.find((w) => !w.tokens?.space && w.label === label && tabsOf(w.workspace_id).every((t) => looksOurs(t.label)));
+    if (ws) ws.tokens = { ...ws.tokens, space: id };
   }
 }
 
-function reconcile(spaces: Map<string, Space>, ms: ReturnType<typeof machines>) {
-  const offline = (address: string) => {
-    const m = address.includes("/") ? address.split("/")[0] : null;
-    return m !== null && ![...ms.values()].some((x) => x.name === m && x.connected);
-  };
-  const owned = loadOwned(); // space id -> workspace label
+function reconcile(spaces: Map<string, Space>, ms: Machines) {
   const workspaces: any[] = herdr("workspace", "list").workspaces ?? [];
-  for (const ws of workspaces) {
-    if (ws.tokens?.space) continue;
-    const id = Object.keys(owned).find((id) => owned[id] === ws.label);
-    if (id && !workspaces.some((w) => w.tokens?.space === id)) ws.tokens = { ...ws.tokens, space: id };
-  }
+  claimRestored(workspaces);
   const live = new Set<string>();
   const next: Record<string, string> = {};
 
   for (const space of spaces.values()) {
+    gone.delete(space.id);
     let ws = workspaces.find((w) => w.tokens?.space === space.id);
     let tabs: any[] = [];
     if (ws) {
       adopt(ws.workspace_id);
-      tabs = herdr("tab", "list", "--workspace", ws.workspace_id).tabs ?? [];
+      tabs = tabsOf(ws.workspace_id);
     }
     for (const agent of space.agents) {
       let tab = tabs.find((t) => attached.get(t.tab_id) === agent.address);
@@ -210,64 +232,82 @@ function reconcile(spaces: Map<string, Space>, ms: ReturnType<typeof machines>) 
     if (!ws) continue;
     herdr("workspace", "report-metadata", ws.workspace_id, "--source", SOURCE, "--token", `space=${space.id}`);
     next[space.id] = ws.label;
-    // Tabs on agents that ended, and our tabs restored from before a restart that no agent
-    // claimed. Other tabs the human opened here stay.
-    for (const tab of tabs) {
-      if (live.has(tab.tab_id)) continue;
-      const address = attached.get(tab.tab_id);
-      if (address ? offline(address) : !looksOurs(tab.label)) continue;
-      herdr("tab", "close", tab.tab_id);
-      attached.delete(tab.tab_id);
-      log(`closed tab ${space.label} ${tab.label}`);
-    }
+    closeEnded(space.label, tabs, live, ms);
   }
 
-  // Spaces with no agents left.
+  // Spaces with no agents left lose our tabs; closing the last tab closes the workspace,
+  // so one where the human opened tabs of their own stays with those.
   for (const ws of workspaces) {
     const id = ws.tokens?.space;
     if (!id || spaces.has(id)) continue;
-    const [, machineId = ""] = id.match(/^p:([^:]*):/) ?? [];
-    const machine = ms.get(machineId);
-    if (machine && !machine.connected) {
-      next[id] = ws.label;
-      continue;
-    }
-    herdr("workspace", "close", ws.workspace_id);
-    log(`closed workspace ${ws.label}`);
+    next[id] = ws.label;
+    const machine = ms.get(spaceMachine(id));
+    if (machine && !machine.connected) continue;
+    if (!gone.has(id)) gone.set(id, Date.now());
+    if (Date.now() - gone.get(id)! < GONE_MS) continue;
+    adopt(ws.workspace_id);
+    closeEnded(ws.label, tabsOf(ws.workspace_id), live, ms);
+    gone.delete(id);
+    delete next[id];
   }
-  for (const tabId of attached.keys()) if (!live.has(tabId) && !offline(attached.get(tabId)!)) attached.delete(tabId);
+  for (const [tabId, address] of attached) if (!live.has(tabId) && !offline(address, ms)) attached.delete(tabId);
   writeFileSync(stateFile, JSON.stringify(next, null, 2));
 }
 
-// One sync per herdr server: a pid file keyed by its socket (and its state file beside it).
-function lock(): boolean {
-  const dir = process.env.HERDR_PLUGIN_STATE_DIR ?? join(homedir(), ".local/state/herdr-shepherdr");
-  mkdirSync(dir, { recursive: true });
-  const socket = process.env.HERDR_SOCKET_PATH ?? "default";
-  const id = createHash("sha256").update(socket).digest("hex").slice(0, 12);
-  const file = join(dir, `sync-${id}.pid`);
-  stateFile = join(dir, `spaces-${id}.json`);
-  for (let i = 0; i < 2; i++) {
+// Closes the tabs on agents that ended, and our tabs restored from before a restart that
+// no agent claimed. Other tabs the human opened stay.
+function closeEnded(where: string, tabs: any[], live: Set<string>, ms: Machines) {
+  for (const tab of tabs) {
+    if (live.has(tab.tab_id)) continue;
+    const address = attached.get(tab.tab_id);
+    if (address ? offline(address, ms) : !looksOurs(tab.label)) continue;
+    herdr("tab", "close", tab.tab_id);
+    attached.delete(tab.tab_id);
+    log(`closed tab ${where} ${tab.label}`);
+  }
+}
+
+function stillLinked(): boolean {
+  const plugins = herdr("plugin", "list", "--json").plugins ?? [];
+  return plugins.some((p: any) => p.plugin_id === PLUGIN && p.enabled);
+}
+
+const pidAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// Waits a little for an old holder: on a live handoff the new server starts its hook
+// before the old server's sync has noticed and left.
+async function lock(): Promise<boolean> {
+  for (let i = 0; i < 10; i++) {
     try {
-      const fd = openSync(file, "wx");
+      const fd = openSync(pidFile, "wx");
       writeFileSync(fd, String(process.pid));
       closeSync(fd);
-      const release = () => {
+      process.on("exit", () => {
         try {
-          if (readFileSync(file, "utf8") === String(process.pid)) unlinkSync(file);
+          if (readFileSync(pidFile, "utf8") === String(process.pid)) unlinkSync(pidFile);
         } catch {}
-      };
-      process.on("exit", release);
+      });
       for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, () => process.exit(0));
       return true;
     } catch {
-      const pid = Number(readFileSync(file, "utf8"));
-      let alive = false;
+      let pid = 0;
       try {
-        alive = readFileSync(`/proc/${pid}/cmdline`, "utf8").includes("sync.ts");
+        pid = Number(readFileSync(pidFile, "utf8"));
       } catch {}
-      if (alive) return false;
-      unlinkSync(file); // left by a sync that died
+      if (!pid || !pidAlive(pid)) {
+        try {
+          unlinkSync(pidFile); // left by a sync that died
+        } catch {}
+        continue;
+      }
+      await Bun.sleep(1_000);
     }
   }
   return false;
@@ -279,16 +319,16 @@ async function sync() {
   if (running) return void (again = true);
   running = true;
   try {
+    if (!stillLinked()) {
+      log("plugin unlinked or disabled, exiting");
+      process.exit(0);
+    }
     do {
       again = false;
       const ms = machines();
       reconcile(desiredSpaces(await snapshot(), ms), ms);
     } while (again);
   } catch (e) {
-    if (e instanceof HerdrGone) {
-      log("herdr server gone, exiting");
-      process.exit(0);
-    }
     log("sync failed:", (e as Error).message);
   } finally {
     running = false;
@@ -307,17 +347,18 @@ async function follow() {
     const p = Bun.spawn([HC, "events", "--json"], { stdout: "pipe", stderr: "ignore", stdin: "ignore", env: { ...process.env } });
     const decoder = new TextDecoder();
     for await (const chunk of p.stdout) {
-      if (!decoder.decode(chunk).includes('"heartbeat"')) soon();
+      if (!decoder.decode(chunk, { stream: true }).includes('"heartbeat"')) soon();
     }
     log("hc events ended, following again");
     await Bun.sleep(5_000);
   }
 }
 
-if (!lock()) {
-  log("a sync already runs for this herdr server");
+if (!(await lock())) {
+  console.error("a sync already runs for this herdr server");
   process.exit(0);
 }
+writeFileSync(logFile, "");
 log("sync started");
 // herdr leaves its plugin commands running when its server stops; leave with the server.
 const server = process.ppid;
