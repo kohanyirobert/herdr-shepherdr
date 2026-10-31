@@ -6,7 +6,7 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const HERDR = process.env.HERDR_BIN_PATH ?? "herdr";
 const HC = process.env.SHEPHERDR_HC ?? "hc";
@@ -94,6 +94,10 @@ function machines(): Machines {
 
 // An address on a machine that isn't connected right now ("zephyrus/t15" while zephyrus is away).
 function offline(address: string, ms: Machines): boolean {
+  if (address.startsWith(LOOP)) {
+    const machine = ms.get(spaceMachine(address.slice(LOOP.length)));
+    return !!machine && !machine.connected;
+  }
   if (!address.includes("/")) return false;
   const name = address.split("/")[0];
   return ![...ms.values()].some((m) => m.name === name && m.connected);
@@ -140,11 +144,24 @@ const attached = new Map<string, string>();
 const opened = new Map<string, number>(); // address -> when we last opened a tab on it
 const gone = new Map<string, number>(); // space id -> since when it has no agents
 
-// The address the `hc attach` in this pane is on, if one runs there.
+// A coordinator's tab runs attach-coordinator.sh, which attaches to whatever address the
+// sync writes to its space's file; it stands in the attached map as "loop:<space>".
+const LOOP = "loop:";
+const SCRIPT = "attach-coordinator.sh";
+const coordinatorsDir = join(stateDir, "coordinators");
+mkdirSync(coordinatorsDir, { recursive: true });
+const coordinatorFile = (space: string) => join(coordinatorsDir, encodeURIComponent(space));
+
+// The address the `hc attach` in this pane is on, or the coordinator loop running there.
 function attachedTo(paneId: string): string | undefined {
   const info = run([HERDR, "pane", "process-info", "--pane", paneId]);
   if (!info.ok) return undefined;
-  for (const p of JSON.parse(info.out).result.process_info.foreground_processes ?? []) {
+  const fg: any[] = JSON.parse(info.out).result.process_info.foreground_processes ?? [];
+  for (const p of fg) {
+    const i = p.argv?.findIndex((a: string) => basename(a) === SCRIPT) ?? -1;
+    if (i >= 0 && p.argv[i + 1]) return LOOP + decodeURIComponent(basename(p.argv[i + 1]));
+  }
+  for (const p of fg) {
     const i = p.argv?.indexOf("attach") ?? -1;
     if (i > 0 && /(^|\/)hc$/.test(p.argv[i - 1]) && p.argv[i + 1]) return p.argv[i + 1];
   }
@@ -182,12 +199,17 @@ function firstPane(workspaceId: string, tabId: string): string | undefined {
   return (herdr("pane", "list", "--workspace", workspaceId).panes ?? []).find((p: any) => p.tab_id === tabId)?.pane_id;
 }
 
-// A task's attach takes its tab (and so its workspace) along when it ends. The
-// coordinator's leaves its shell, so the space's workspace, which its tasks nest under,
-// stays in place while the coordinator restarts.
-function attach(paneId: string, address: string, keepShell = false) {
+// Only ever into a pane we just opened, or an idle shell of ours: typed into anything
+// else (an attach above all) it would reach an agent as a message. A task's attach takes
+// its tab (and so its workspace) along when it ends. The coordinator's loop stays, so
+// the space's workspace, which its tasks nest under, stays in place while the
+// coordinator restarts.
+function attach(paneId: string, address: string) {
   const unset = HC_IDENTITY.map((name) => `-u ${name}`).join(" ");
-  herdr("pane", "run", paneId, `${keepShell ? "" : "exec "}env ${unset} HC_SESSION=${SESSION} ${HC} attach ${address}`);
+  const what = address.startsWith(LOOP)
+    ? `HC=${HC} sh ${join(import.meta.dir, SCRIPT)} ${coordinatorFile(address.slice(LOOP.length))}`
+    : `${HC} attach ${address}`;
+  herdr("pane", "run", paneId, `exec env ${unset} HC_SESSION=${SESSION} ${what}`);
   opened.set(address, Date.now());
 }
 
@@ -221,8 +243,8 @@ function baseOf(space: Space): Base {
   const from = coordinator?.cwd ?? space.agents[0]?.cwd;
   if (local && from && existsSync(join(from, ".git"))) {
     const r = git(from, "worktree", "list", "--porcelain");
-    if (!r.ok) throw new Error(`git worktree list in ${from}: ${r.err.trim()}`); // not a reason to replace its workspace
-    const paths = [...r.out.matchAll(/^worktree (.*)$/gm)].map((m) => m[1]);
+    // Git refusing the repo (another owner, say) leaves the space with a stand-in.
+    const paths = r.ok ? [...r.out.matchAll(/^worktree (.*)$/gm)].map((m) => m[1]) : [];
     if (paths[0] && (!coordinator || paths[0] === from)) return { root: paths[0], linked: new Set(paths.slice(1)) };
   }
   const dir = join(stateDir, "stand-ins", createHash("sha256").update(space.id).digest("hex").slice(0, 12));
@@ -338,27 +360,23 @@ function reconcile(spaces: Map<string, Space>, ms: Machines) {
       return { tabId: r.tab.tab_id, paneId: r.root_pane.pane_id };
     };
 
+    // The coordinator loop follows this file, so its tab stays across restarts.
+    const coordinator = space.agents.find((a) => !a.task)?.address ?? "";
+    const file = coordinatorFile(space.id);
+    if ((existsSync(file) ? readFileSync(file, "utf8") : "") !== coordinator) writeFileSync(file, coordinator);
+
     for (const agent of space.agents) {
-      let tab = tabs.find((t) => attached.get(t.tab_id) === agent.address);
+      const address = agent.task ? agent.address : LOOP + space.id;
+      let tab = tabs.find((t) => attached.get(t.tab_id) === address);
       if (!tab) {
         // A tab herdr restored as a plain shell after a restart: put the agent back in it.
-        // Or the coordinator's shell, left by the coordinator before this one.
-        const free = (t: any) => !space.agents.some((a) => a.address === attached.get(t.tab_id));
-        tab = tabs.find((t) => free(t) && !live.has(t.tab_id) && keyOf(t.label) === agent.key);
+        tab = tabs.find((t) => !attached.has(t.tab_id) && !live.has(t.tab_id) && keyOf(t.label) === agent.key);
         const paneId = tab && firstPane(tab.workspace_id, tab.tab_id);
         if (paneId && tab.pane_count === 1 && idleShell(paneId)) {
-          attached.set(tab.tab_id, agent.address);
-          attach(paneId, agent.address, !agent.task);
+          attached.set(tab.tab_id, address);
+          attach(paneId, address);
           log(`reattached ${space.label} ${agent.label} -> ${agent.address}`);
         } else tab = undefined;
-      }
-      if (tab && !agent.task && Date.now() - (opened.get(agent.address) ?? 0) >= REOPEN_MS) {
-        // Detached with ctrl+\: back to its shell, so attach again.
-        const paneId = tab.pane_count === 1 ? firstPane(tab.workspace_id, tab.tab_id) : undefined;
-        if (paneId && idleShell(paneId)) {
-          attach(paneId, agent.address, true);
-          log(`reattached ${space.label} ${agent.label} -> ${agent.address}`);
-        }
       }
       if (tab) {
         live.add(tab.tab_id);
@@ -369,7 +387,7 @@ function reconcile(spaces: Map<string, Space>, ms: Machines) {
         }
         continue;
       }
-      if (Date.now() - (opened.get(agent.address) ?? 0) < REOPEN_MS) continue;
+      if (Date.now() - (opened.get(address) ?? 0) < REOPEN_MS) continue;
 
       let where: { tabId: string; paneId: string } | undefined;
       if (!main) {
@@ -404,9 +422,9 @@ function reconcile(spaces: Map<string, Space>, ms: Machines) {
         const r = herdr("tab", "create", "--workspace", main.workspace_id, "--label", agent.label, "--cwd", base.root, "--no-focus");
         where = { tabId: r.tab.tab_id, paneId: r.root_pane.pane_id };
       }
-      attached.set(where.tabId, agent.address);
+      attached.set(where.tabId, address);
       live.add(where.tabId);
-      attach(where.paneId, agent.address, !agent.task);
+      attach(where.paneId, address);
       log(`tab ${space.label} ${agent.label} -> ${agent.address}`);
     }
 
