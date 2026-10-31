@@ -14,7 +14,8 @@ open herdr and they are there:
 
 It stays in sync while herdr runs: a new task gets a tab, a task that ends loses its tab, and a space with no agents
 left loses its workspace. Tabs you open yourself in those workspaces are left alone (a workspace with one of yours
-stays open). Browser and helper shells are not shown.
+stays open), unless you name them like ours (`coordinator`, `FOUR-4`). A tab of ours where you split off a pane of
+your own becomes yours when its agent ends: it is renamed `ended …` and kept. Browser and helper shells are not shown.
 
 ## Install
 
@@ -31,7 +32,7 @@ The sync starts with the herdr server. If herdr is already running, start it onc
 herdr plugin action invoke shepherdr.sync
 ```
 
-Remove it with `herdr plugin unlink shepherdr`: the sync stops within 15 seconds, then close its workspaces
+Remove it with `herdr plugin unlink shepherdr`: the sync stops within half a minute, then close its workspaces
 yourself.
 
 ## How it works
@@ -43,7 +44,7 @@ first line of `hc events` is a snapshot with labels, both machines included) and
 - agents are the live terminals labelled `shepherdr.role` `coordinator` or `task`, grouped by `shepherdr.space`;
 - a workspace is ours by its `space` metadata token. A herdr restart forgets tokens and brings tabs back as
   plain shells, so the plugin's state directory keeps each workspace's label: a restored workspace with that label
-  whose tabs all look like ours (`coordinator`, `FOUR-4 …`) is taken back and its tabs get their agents again;
+  with a tab that looks like ours (`coordinator`, `FOUR-4 …`) is taken back and its tabs get their agents again;
 - the sync closes nothing of a machine that is disconnected (an attach may still end by itself); its agents come
   back when it reconnects.
 

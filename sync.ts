@@ -137,7 +137,6 @@ function desiredSpaces(terminals: Terminal[], ms: Machines): Map<string, Space> 
 const attached = new Map<string, string>();
 const opened = new Map<string, number>(); // address -> when we last opened a tab on it
 const gone = new Map<string, number>(); // space id -> since when it has no agents
-const released = new Set<string>(); // our tabs the human split a pane into: theirs once the agent ends
 
 // The address the `hc attach` in this pane is on, if one runs there.
 function attachedTo(paneId: string): string | undefined {
@@ -149,10 +148,12 @@ function attachedTo(paneId: string): string | undefined {
   }
 }
 
-// Whether a tab's only pane still runs our attach, rather than a pane the human split off.
-function attachedPane(tab: any): boolean {
-  const paneId = firstPane(tab.workspace_id, tab.tab_id);
-  return !!paneId && !!attachedTo(paneId);
+// Whether a pane is a shell at its prompt, with nothing of the human's running in it.
+function idleShell(paneId: string): boolean {
+  const info = run([HERDR, "pane", "process-info", "--pane", paneId]);
+  if (!info.ok) return false;
+  const p = JSON.parse(info.out).result.process_info;
+  return p.shell_pid === p.foreground_process_group_id;
 }
 
 function adopt(workspaceId: string) {
@@ -184,8 +185,8 @@ function tabsOf(workspaceId: string): any[] {
 
 // Workspace tokens don't survive a herdr restart, so the state file remembers the label
 // each of our workspaces had. A restored workspace is ours again only if its label is
-// one of those and every tab in it looks like ours, so the human's own workspace of the
-// same name is never taken.
+// one of those and a tab in it looks like ours, so the human's own workspace of the same
+// name is never taken. Their tabs in ours stay theirs either way.
 function claimRestored(workspaces: any[]) {
   let owned: Record<string, string> = {};
   try {
@@ -193,7 +194,7 @@ function claimRestored(workspaces: any[]) {
   } catch {}
   for (const [id, label] of Object.entries(owned)) {
     if (workspaces.some((w) => w.tokens?.space === id)) continue;
-    const ws = workspaces.find((w) => !w.tokens?.space && w.label === label && tabsOf(w.workspace_id).every((t) => looksOurs(t.label)));
+    const ws = workspaces.find((w) => !w.tokens?.space && w.label === label && tabsOf(w.workspace_id).some((t) => looksOurs(t.label)));
     if (ws) ws.tokens = { ...ws.tokens, space: id };
   }
 }
@@ -216,9 +217,9 @@ function reconcile(spaces: Map<string, Space>, ms: Machines) {
       let tab = tabs.find((t) => attached.get(t.tab_id) === agent.address);
       if (!tab) {
         // A tab herdr restored as a plain shell after a restart: put the agent back in it.
-        tab = tabs.find((t) => !attached.has(t.tab_id) && !live.has(t.tab_id) && !released.has(t.tab_id) && keyOf(t.label) === agent.key);
+        tab = tabs.find((t) => !attached.has(t.tab_id) && !live.has(t.tab_id) && keyOf(t.label) === agent.key);
         const paneId = tab && firstPane(ws.workspace_id, tab.tab_id);
-        if (paneId) {
+        if (paneId && tab.pane_count === 1 && idleShell(paneId)) {
           attached.set(tab.tab_id, agent.address);
           attach(paneId, agent.address);
           log(`reattached ${space.label} ${agent.label} -> ${agent.address}`);
@@ -274,20 +275,21 @@ function reconcile(spaces: Map<string, Space>, ms: Machines) {
 }
 
 // Closes the tabs on agents that ended, and our tabs restored from before a restart that
-// no agent claimed. Other tabs the human opened stay, and so does one of ours where the
-// human split off a pane of their own: only the attach in it ends.
+// no agent claimed, when nothing else runs in them. One where the human split off a pane
+// or started something of their own becomes theirs: renamed so it no longer looks ours.
 function closeEnded(where: string, tabs: any[], live: Set<string>, ms: Machines) {
   for (const tab of tabs) {
-    if (live.has(tab.tab_id) || released.has(tab.tab_id)) continue;
+    if (live.has(tab.tab_id)) continue;
     const address = attached.get(tab.tab_id);
     if (address ? offline(address, ms) : !looksOurs(tab.label)) continue;
     attached.delete(tab.tab_id);
-    if (address && !(tab.pane_count === 1 && attachedPane(tab))) {
-      released.add(tab.tab_id);
-      continue;
+    const paneId = tab.pane_count === 1 ? firstPane(tab.workspace_id, tab.tab_id) : undefined;
+    if (paneId && (address ? attachedTo(paneId) : idleShell(paneId))) {
+      // The attach usually ends by itself and takes its tab along; it may beat us to it.
+      if (run([HERDR, "tab", "close", tab.tab_id]).ok) log(`closed tab ${where} ${tab.label}`);
+    } else if (run([HERDR, "tab", "rename", tab.tab_id, `ended ${tab.label}`]).ok) {
+      log(`left tab ${where} ${tab.label} to the human`);
     }
-    // The attach usually ends by itself and takes its tab along; it may beat us to it.
-    if (run([HERDR, "tab", "close", tab.tab_id]).ok) log(`closed tab ${where} ${tab.label}`);
   }
 }
 
@@ -384,7 +386,6 @@ if (!(await lock())) {
   console.error("a sync already runs for this herdr server");
   process.exit(0);
 }
-writeFileSync(logFile, "");
 log("sync started");
 // herdr leaves its plugin commands running when its server stops; leave with the server.
 const server = process.ppid;
