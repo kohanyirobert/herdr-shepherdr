@@ -11,13 +11,17 @@ import { basename, join } from "node:path";
 const HERDR = process.env.HERDR_BIN_PATH ?? "herdr";
 const HC = process.env.SHEPHERDR_HC ?? "hc";
 const PLUGIN = process.env.HERDR_PLUGIN_ID ?? "shepherdr";
-// Shepherdr runs its agents in herdr-core's "shepherdr" session. Drop any hc identity
+// Shepherdr runs its agents in herdr-core's "shepherdr" session on its own machine, and in
+// the "default" session on a machine it reaches over ssh: the first of those with any
+// Shepherdr agent in it, unless SHEPHERDR_HC_SESSION names one. Drop any hc identity
 // herdr inherited (say, when it was started inside a core terminal) so hc talks to that
 // session as the human, and the panes we start do the same.
-const SESSION = process.env.SHEPHERDR_HC_SESSION ?? "shepherdr";
+const SESSIONS = process.env.SHEPHERDR_HC_SESSION ? [process.env.SHEPHERDR_HC_SESSION] : ["shepherdr", "default"];
+let session = SESSIONS[0];
+let sessionFound = SESSIONS.length === 1;
 const HC_IDENTITY = ["HC_SOCKET", "HC_SCOPE", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET"];
 for (const name of HC_IDENTITY) delete process.env[name];
-process.env.HC_SESSION = SESSION;
+process.env.HC_SESSION = session;
 const SOURCE = "shepherdr"; // workspace metadata source; its `space` token marks our workspaces
 const TICK_MS = 15_000; // also catches tabs the human closed, which hc events can't see
 const REOPEN_MS = 30_000; // an attach that keeps failing can't spin
@@ -44,6 +48,17 @@ const serverId = createHash("sha256").update(process.env.HERDR_SOCKET_PATH ?? "d
 const pidFile = join(stateDir, `sync-${serverId}.pid`);
 const stateFile = join(stateDir, `spaces-${serverId}.json`);
 const logFile = join(stateDir, `sync-${serverId}.log`);
+// Only this machine's spaces, unless the config file says { "machines": "all" }.
+const configFile = join(process.env.HERDR_PLUGIN_CONFIG_DIR ?? join(homedir(), ".config/herdr/plugins/config", PLUGIN), "config.json");
+let allMachines = false;
+function readConfig() {
+  let all = false;
+  try {
+    all = JSON.parse(readFileSync(configFile, "utf8")).machines === "all";
+  } catch {}
+  if (all !== allMachines) log(all ? "showing every machine's spaces" : "showing this machine's spaces only");
+  allMachines = all;
+}
 
 function log(...args: unknown[]) {
   const line = [new Date().toISOString(), ...args].join(" ");
@@ -65,8 +80,8 @@ function herdr(...args: string[]): any {
 }
 
 // The first line of `hc events` is a snapshot of every terminal on every machine, labels included.
-async function snapshot(): Promise<Terminal[]> {
-  const p = Bun.spawn([HC, "events", "--json"], { stdout: "pipe", stderr: "ignore", stdin: "ignore", env: { ...process.env } });
+async function snapshot(of = session): Promise<Terminal[]> {
+  const p = Bun.spawn([HC, "events", "--json"], { stdout: "pipe", stderr: "ignore", stdin: "ignore", env: { ...process.env, HC_SESSION: of } });
   const decoder = new TextDecoder();
   const timeout = setTimeout(() => p.kill(), 10_000);
   let buf = "";
@@ -84,6 +99,24 @@ async function snapshot(): Promise<Terminal[]> {
   return JSON.parse(line).terminals ?? [];
 }
 
+// The session Shepherdr's agents are in, looked for until one has any; a session whose
+// core isn't running is skipped rather than started.
+async function findSession() {
+  const dir = process.env.XDG_RUNTIME_DIR && join(process.env.XDG_RUNTIME_DIR, "herdr-core");
+  for (const s of SESSIONS) {
+    if (dir && !existsSync(join(dir, `${s}.sock`))) continue;
+    const terminals = await snapshot(s).catch(() => []);
+    if (!terminals.some((t) => t.labels?.["shepherdr.role"])) continue;
+    if (s !== session) {
+      session = process.env.HC_SESSION = s;
+      events?.kill(); // follow() starts again on this session
+    }
+    sessionFound = true;
+    log(`following hc session ${s}`);
+    return;
+  }
+}
+
 function machines(): Machines {
   const r = run([HC, "machine", "ls", "--json"]);
   if (!r.ok) throw new Error(`hc machine ls: ${r.err.trim()}`);
@@ -91,6 +124,10 @@ function machines(): Machines {
   for (const m of JSON.parse(r.out).machines ?? []) map.set(m.id, { name: m.name, connected: m.state === "connected" });
   return map;
 }
+
+// Whether a sync keeps an agent's tab while its machine is away: only for another
+// machine's spaces, which it shows only when told to show every machine's.
+const away = (address: string, ms: Machines) => allMachines && offline(address, ms);
 
 // An address on a machine that isn't connected right now ("zephyrus/t15" while zephyrus is away).
 function offline(address: string, ms: Machines): boolean {
@@ -113,6 +150,7 @@ function desiredSpaces(terminals: Terminal[], ms: Machines): Map<string, Space> 
   const spaces = new Map<string, Space>();
   const agents = terminals
     .filter((t) => t.state === "live" && !offline(t.address, ms))
+    .filter((t) => allMachines || !t.address.includes("/")) // "zephyrus/t15" runs on another machine
     .filter((t) => ["coordinator", "task"].includes(t.labels?.["shepherdr.role"] ?? ""))
     .filter((t) => !t.name?.startsWith("sb-") && t.argv?.[0] !== "sh")
     .sort((a, b) => a.created_ms - b.created_ms);
@@ -121,7 +159,7 @@ function desiredSpaces(terminals: Terminal[], ms: Machines): Map<string, Space> 
     if (!id) continue;
     const folder = id.match(/^p:[^:]*:(.*)$/)?.[1] ?? id;
     const name = folder === "~" ? "home" : folder; // Shepherdr calls the home folder's space "home"
-    const machine = ms.get(spaceMachine(id))?.name;
+    const machine = allMachines ? ms.get(spaceMachine(id))?.name : undefined;
     let space = spaces.get(id);
     if (!space) spaces.set(id, (space = { id, label: machine ? `${machine}/${name}` : name, folder: name, agents: [] }));
     const coordinator = t.labels!["shepherdr.role"] === "coordinator";
@@ -214,7 +252,7 @@ function attach(paneId: string, address: string) {
   const what = address.startsWith(LOOP)
     ? `HC=${quote(HC)} sh ${quote(script)} ${quote(coordinatorFile(address.slice(LOOP.length)))}`
     : `${HC} attach ${address}`;
-  herdr("pane", "run", paneId, `exec env ${unset} HC_SESSION=${SESSION} ${what}`);
+  herdr("pane", "run", paneId, `exec env ${unset} HC_SESSION=${quote(session)} ${what}`);
   opened.set(address, Date.now());
 }
 
@@ -467,7 +505,7 @@ function reconcile(spaces: Map<string, Space>, ms: Machines) {
     const wss = ofSpace(id);
     for (const ws of wss) keep(ws);
     const machine = ms.get(spaceMachine(id));
-    if (machine && !machine.connected) continue;
+    if (allMachines && machine && !machine.connected) continue;
     if (!gone.has(id)) gone.set(id, Date.now());
     if (Date.now() - gone.get(id)! < GONE_MS) continue;
     writeFileSync(coordinatorFile(id), ""); // a coordinator tab that can't close waits idle
@@ -478,7 +516,7 @@ function reconcile(spaces: Map<string, Space>, ms: Machines) {
     }
     gone.delete(id);
   }
-  for (const [tabId, address] of attached) if (!live.has(tabId) && !offline(address, ms)) attached.delete(tabId);
+  for (const [tabId, address] of attached) if (!live.has(tabId) && !away(address, ms)) attached.delete(tabId);
   writeFileSync(stateFile, JSON.stringify([...next.values()], null, 2));
 }
 
@@ -489,7 +527,7 @@ function closeEnded(where: string, tabs: any[], live: Set<string>, ms: Machines)
   for (const tab of tabs) {
     if (live.has(tab.tab_id)) continue;
     const address = attached.get(tab.tab_id);
-    if (address ? offline(address, ms) : !looksOurs(tab.label)) continue;
+    if (address ? away(address, ms) : !looksOurs(tab.label)) continue;
     attached.delete(tab.tab_id);
     const paneId = tab.pane_count === 1 ? firstPane(tab.workspace_id, tab.tab_id) : undefined;
     if (paneId && ((address && attachedTo(paneId)) || idleShell(paneId))) {
@@ -556,6 +594,8 @@ async function sync() {
       log("plugin unlinked or disabled, exiting");
       process.exit(0);
     }
+    readConfig();
+    if (!sessionFound) await findSession();
     do {
       again = false;
       const ms = machines();
@@ -575,9 +615,10 @@ function soon() {
 }
 
 // Every change in herdr-core (a terminal started, ended or relabelled) triggers a sync.
+let events: ReturnType<typeof Bun.spawn> | undefined;
 async function follow() {
   for (;;) {
-    const p = Bun.spawn([HC, "events", "--json"], { stdout: "pipe", stderr: "ignore", stdin: "ignore", env: { ...process.env } });
+    const p = (events = Bun.spawn([HC, "events", "--json"], { stdout: "pipe", stderr: "ignore", stdin: "ignore", env: { ...process.env } }));
     const decoder = new TextDecoder();
     let buf = "";
     for await (const chunk of p.stdout) {
