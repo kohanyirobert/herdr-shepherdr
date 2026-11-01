@@ -37,9 +37,9 @@ sidebar (Local for this one, one per machine):
 herdr machine add <ssh target>     # say, herdr machine add sakasa on the laptop
 ```
 
-To have one herdr show every machine's spaces itself instead (`zephyrus/four-eyes`), as before, put this in
-`~/.config/herdr/plugins/config/shepherdr/config.json`; the sync picks it up within 15 seconds, and drops them again
-when it is removed:
+To have the herdr where Shepherdr runs show every machine's spaces itself instead (`zephyrus/four-eyes`), as
+before, put this in `~/.config/herdr/plugins/config/shepherdr/config.json`; the sync picks it up within 15 seconds,
+and drops them again when it is removed:
 
 ```json
 { "machines": "all" }
@@ -54,7 +54,8 @@ herdr nests a workspace only as a linked Git worktree of the repo its parent wor
 - a space on this machine whose coordinator runs in a repo's main checkout (`~/Work/herdr-shepherdr`) is that repo:
   its workspace opens there, and each task opens on its own worktree (`~/.shepherdr/worktrees/…`), the same as
   `herdr worktree open`. A new tab in a task's workspace starts in its checkout;
-- a space on another machine (shown with `"machines": "all"`), or one not in a repo (`home`), has no checkout here. It gets a stand-in instead: an
+- a space on another machine (with `"machines": "all"`), or one not in a repo (`home`), has no checkout
+  here. It gets a stand-in instead: an
   empty repo in the plugin's state directory (`stand-ins/`) with an empty linked worktree per task, which only
   exists so herdr nests them (they are small and kept; delete `stand-ins/` with the plugin unlinked to clear them).
   New tabs in those workspaces start in that empty folder, not in `~` or the task's checkout on the other machine;

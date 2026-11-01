@@ -99,14 +99,14 @@ async function snapshot(of = session): Promise<Terminal[]> {
   return JSON.parse(line).terminals ?? [];
 }
 
-// The session Shepherdr's agents are in, looked for until one has any; a session whose
+// The session Shepherdr's agents are in, looked for until one has a live one; a session whose
 // core isn't running is skipped rather than started.
 async function findSession() {
   const dir = process.env.XDG_RUNTIME_DIR && join(process.env.XDG_RUNTIME_DIR, "herdr-core");
   for (const s of SESSIONS) {
     if (dir && !existsSync(join(dir, `${s}.sock`))) continue;
     const terminals = await snapshot(s).catch(() => []);
-    if (!terminals.some((t) => t.labels?.["shepherdr.role"])) continue;
+    if (!terminals.some((t) => t.state === "live" && t.labels?.["shepherdr.role"])) continue;
     if (s !== session) {
       session = process.env.HC_SESSION = s;
       events?.kill(); // follow() starts again on this session
